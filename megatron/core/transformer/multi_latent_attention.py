@@ -24,6 +24,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import deprecate_inference_params
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 
 
 @dataclass
@@ -100,18 +101,28 @@ class MultiLatentAttention(Attention):
                 f"Unsupported RoPE type: {self.config.rope_type}, supported types are "
                 "'rope' and 'yarn'"
             )
-
-        self.core_attention = build_module(
-            submodules.core_attention,
-            config=self.config,
-            layer_number=self.layer_number,
-            attn_mask_type=self.attn_mask_type,
-            attention_type=self.attention_type,
-            softmax_scale=self.softmax_scale,
-            k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
-            cp_comm_type=cp_comm_type,
-        )
+        if isinstance(submodules.core_attention, TEDotProductAttention):
+            self.core_attention = build_module(
+                submodules.core_attention,
+                config=self.config,
+                layer_number=self.layer_number,
+                attn_mask_type=self.attn_mask_type,
+                attention_type=self.attention_type,
+                softmax_scale=self.softmax_scale,
+                k_channels=self.q_head_dim,
+                v_channels=self.config.v_head_dim,
+                cp_comm_type=cp_comm_type,
+            )
+        else:
+            self.core_attention = build_module(
+                submodules.core_attention,
+                config=self.config,
+                layer_number=self.layer_number,
+                attn_mask_type=self.attn_mask_type,
+                attention_type=self.attention_type,
+                softmax_scale=self.softmax_scale,
+                cp_comm_type=cp_comm_type,
+            )
 
         # Output.
         self.linear_proj = build_module(
