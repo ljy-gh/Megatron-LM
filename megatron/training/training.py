@@ -680,7 +680,17 @@ def pretrain(
     # If using dualpipev, initialize DualPipeV.
     if args.dualpipev:
         from megatron.core.pipeline_parallel.dualpipev import DualPipeV
+        from megatron.core.pipeline_parallel.dualpipev_comm import set_p2p_tensor_shapes, set_p2p_tensor_dtype
         dualpipev_model = DualPipeV(model, process_group=mpu.get_pipeline_model_parallel_group())
+        set_p2p_tensor_shapes([(args.micro_batch_size, args.seq_length, args.hidden_size)])
+        if args.fp16:
+            set_p2p_tensor_dtype(torch.float16)
+        elif args.bf16:
+            set_p2p_tensor_dtype(torch.bfloat16)
+        else:
+            set_p2p_tensor_dtype(torch.float32)
+    else:
+        dualpipev_model = None
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -733,7 +743,7 @@ def pretrain(
                 model, optimizer, opt_param_scheduler,
                 train_data_iterator, valid_data_iterator,
                 process_non_loss_data_func, config, checkpointing_context,
-                non_loss_data_func)
+                non_loss_data_func, dualpipev_model)
 
         print_datetime('after training is done')
 
@@ -1174,7 +1184,7 @@ def dummy_train_step(data_iterator):
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config):
+               model, optimizer, opt_param_scheduler, config, dualpipev_model):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -1200,16 +1210,23 @@ def train_step(forward_step_func, data_iterator,
         optimizer.zero_grad()
 
         # Forward pass.
-        forward_backward_func = get_forward_backward_func()
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False)
+        if dualpipev_model is not None:
+            losses_reduced = dualpipev_model.step(
+                forward_step_func,
+                data_iterator,
+                get_num_microbatches(),
+            )
+        else:
+            forward_backward_func = get_forward_backward_func()
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False)
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
@@ -1748,7 +1765,7 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
-          process_non_loss_data_func, config, checkpointing_context, non_loss_data_func):
+          process_non_loss_data_func, config, checkpointing_context, non_loss_data_func, dualpipev_model):
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
@@ -1943,7 +1960,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       config)
+                       config,
+                       dualpipev_model)
         ft_integration.on_training_step_end()
         if should_checkpoint:
             save_checkpoint_and_time(iteration, model, optimizer,

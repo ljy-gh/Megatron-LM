@@ -1,4 +1,4 @@
-from typing import Tuple, List, Union, Callable, Optional
+from typing import Iterator, Tuple, List, Union, Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -67,11 +67,10 @@ class DualPipeV(nn.Module):
 
         is_last_stage = (self.is_first_rank and phase == 1)
 
-        outputs = self.module[phase](*inputs)
+        outputs, loss_func = self.forward_step_func(inputs, self.module[phase])
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
-        if is_last_stage and self.criterion is not None:
-            labels = self.labels[chunk_id]
-            loss = self.criterion(*outputs, *labels)
+        if is_last_stage:
+            loss = loss_func(outputs)
             self.loss_chunks.append(loss)
 
         if self.is_last_rank and phase == 0:
@@ -285,45 +284,40 @@ class DualPipeV(nn.Module):
 
     def step(
         self,
-        *inputs: Optional[torch.Tensor],
+        forward_step_func,
+        data_iterator: Iterator,
         num_chunks: int = 0,
-        criterion: Optional[Callable] = None,
-        labels: List[Optional[torch.Tensor]] = [],
-        return_outputs: bool = False,
-    ) -> Tuple[Optional[torch.Tensor], Optional[Union[torch.Tensor, Tuple[torch.Tensor]]]]:
+    ) -> Tuple[Optional[torch.Tensor]]:
         """
-        Execute a training or inference step.
+        Execute a training step using virtual dual pipeline parallelism.
 
-        Arguments:
-            *inputs: Module inputs. Required only on the first rank.
-            num_chunks: The number of micro-batches.
-            criterion: Loss function, invoked as ``criterion(*outputs, *labels)``. Required only on the first rank.
-            labels: Labels of the loss function. Required only on the first rank.
-            return_outputs: Whether to return outputs on the first rank. Default: ``False``.
+        Args:
+            forward_step_func: Forward computation function for model.
+            data_iterator: Data iterator
+            num_chunks: Number of micro-batches, must be >= pipeline_parallel_size * 2
 
-        Returns: (loss, outputs)
-            loss: Loss for the batch. Returned only on the first rank.
-            outputs: Module outputs. Returned only if ``return_outputs=True`` and on the first rank.
-
+        Returns:
+            Tuple[Optional[torch.Tensor]]: Loss value, returned only on the first rank
         """
         assert comm.TENSOR_SHAPES is not None and comm.TENSOR_DTYPE is not None, \
             "You need to call set_p2p_tensor_shapes and set_p2p_tensor_dtype before executing a step."
         self.forward_only = not torch.is_grad_enabled()
-        self.return_outputs = return_outputs
+        self.return_outputs = False
+        self.forward_step_func = forward_step_func
 
         rank = self.rank
         num_ranks = self.num_ranks
         assert num_chunks > 0 and num_chunks >= num_ranks * 2, f"{num_chunks=}, {num_ranks=}"
 
-        if not self.forward_only and self.is_first_rank:
-            assert criterion is not None
-
         self._reset_states()
 
         if self.is_first_rank:
-            self.input_chunks = (scatter(inputs, num_chunks, self.batch_dim), [])
-            self.labels = scatter(labels, num_chunks, self.batch_dim)
-            self.criterion = criterion
+            from megatron_patch.template.helper import get_batch
+            micro_batches = []
+            for i in range(num_chunks):
+                mb = get_batch(data_iterator)
+                micro_batches.append(mb)
+            self.input_chunks = (micro_batches, [])
 
         # Step 1: nF0
         step_1 = (num_ranks - rank - 1) * 2
@@ -397,13 +391,8 @@ class DualPipeV(nn.Module):
 
         loss, outputs = None, None
         if self.is_first_rank:
-            if criterion is not None:
-                loss = torch.stack(self.loss_chunks)
-            if return_outputs:
-                outputs = gather(self.output_chunks[1], self.batch_dim)
-                if len(outputs) == 1:
-                    outputs = outputs[0]
+            loss = torch.stack(self.loss_chunks)
 
         self._reset_states()
 
-        return loss, outputs
+        return loss
