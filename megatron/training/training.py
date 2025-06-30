@@ -818,6 +818,33 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Build model.
     def build_model():
         if mpu.get_pipeline_model_parallel_world_size() > 1 and \
+        args.dualpipev:
+            assert model_type != ModelType.encoder_and_decoder, \
+                "Interleaved schedule not supported for model with both encoder and decoder"
+            model = []
+            if mpu.is_pipeline_first_stage():
+                first_model_pre_process = True
+                first_model_post_process = False
+                second_model_pre_process = False
+                second_model_post_process = True
+            else:
+                first_model_pre_process = False
+                first_model_post_process = False
+                second_model_pre_process = False
+                second_model_post_process = False
+            first_model = model_provider_func(
+                pre_process=first_model_pre_process,
+                post_process=first_model_post_process,
+            )
+            first_model.model_type = model_type
+            model.append(first_model)
+            second_model = model_provider_func(
+                pre_process=second_model_pre_process,
+                post_process=second_model_post_process,
+            )
+            second_model.model_type = model_type
+            model.append(second_model)
+        elif mpu.get_pipeline_model_parallel_world_size() > 1 and \
         args.virtual_pipeline_model_parallel_size is not None:
             assert model_type != ModelType.encoder_and_decoder, \
                 "Interleaved schedule not supported for model with both encoder and decoder"

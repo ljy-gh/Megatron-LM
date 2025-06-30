@@ -345,6 +345,11 @@ def validate_args(args, defaults={}):
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
 
+    # Dualpipev
+    if args.dualpipev:
+        assert args.num_virtual_stages_per_pipeline_rank is None, \
+            '--num-virtual-stages-per-pipeline-rank must be set to 1 when using --dualpipev'
+
     # Uneven virtual pipeline parallelism
     assert args.num_layers_per_virtual_pipeline_stage is None or args.num_virtual_stages_per_pipeline_rank is None, \
         '--num-layers-per-virtual-pipeline-stage and --num-virtual-stages-per-pipeline-rank cannot be set at the same time'
@@ -1935,6 +1940,8 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     group = parser.add_argument_group(title='distributed')
 
+    group.add_argument('--dualpipev', type=bool, default=False,
+                       help='Whether to use virtual dual pipeline parallelism.')
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
     group.add_argument('--encoder-tensor-model-parallel-size', type=int, default=0,
