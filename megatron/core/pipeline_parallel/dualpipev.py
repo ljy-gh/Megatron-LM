@@ -12,7 +12,6 @@ class DualPipeV(nn.Module):
     def __init__(
         self,
         modules: Tuple[nn.Module, nn.Module],
-        batch_dim: int = 0,
         process_group: Optional[dist.ProcessGroup] = None,
         rank_mapping: Optional[List[int]] = None,
     ) -> None:
@@ -21,7 +20,6 @@ class DualPipeV(nn.Module):
         assert next(modules[0].parameters()).device == torch.device(torch.cuda.current_device())
         self.module = nn.ModuleList(modules)
         self.overlapped_forward_backward = type(modules[0]) == type(modules[1]) and hasattr(type(modules[0]), "overlapped_forward_backward")
-        self.batch_dim = batch_dim
         self.group = process_group or dist.distributed_c10d._get_default_group()
         self.num_ranks = self.group.size()
 

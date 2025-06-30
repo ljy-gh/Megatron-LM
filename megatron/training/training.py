@@ -677,6 +677,11 @@ def pretrain(
     app_metrics['app_build_optimizer_finish_time'] = one_logger_utils.get_timestamp_in_ms()
     config = get_model_config(model[0])
 
+    # If using dualpipev, initialize DualPipeV.
+    if args.dualpipev:
+        from megatron.core.pipeline_parallel.dualpipev import DualPipeV
+        dualpipev_model = DualPipeV(model, process_group=mpu.get_pipeline_model_parallel_group())
+
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(
