@@ -682,7 +682,7 @@ def pretrain(
         from megatron.core.pipeline_parallel.dualpipev import DualPipeV
         from megatron.core.pipeline_parallel.dualpipev_comm import set_p2p_tensor_shapes, set_p2p_tensor_dtype
         dualpipev_model = DualPipeV(model, process_group=mpu.get_pipeline_model_parallel_group())
-        set_p2p_tensor_shapes([(args.micro_batch_size, args.seq_length, args.hidden_size)])
+        set_p2p_tensor_shapes([(args.seq_length, args.micro_batch_size, args.hidden_size)])
         if args.fp16:
             set_p2p_tensor_dtype(torch.float16)
         elif args.bf16:
@@ -1211,6 +1211,8 @@ def train_step(forward_step_func, data_iterator,
 
         # Forward pass.
         if dualpipev_model is not None:
+            from megatron_patch.template.helper import forward_step_dualpipev
+            forward_step_func = forward_step_dualpipev
             losses_reduced = dualpipev_model.step(
                 forward_step_func,
                 data_iterator,

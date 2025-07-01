@@ -67,10 +67,21 @@ class DualPipeV(nn.Module):
 
         is_last_stage = (self.is_first_rank and phase == 1)
 
-        outputs, loss_func = self.forward_step_func(inputs, self.module[phase])
+        if len(inputs) == 1:
+            from megatron.core.utils import get_attr_wrapped_model
+            set_input_tensor = get_attr_wrapped_model(self.module[phase], "set_input_tensor")
+            set_input_tensor(inputs)
+        if is_last_stage:
+            inputs_with_labels_loss_masks = list(inputs)
+            inputs_with_labels_loss_masks.append(self.labels[chunk_id])
+            inputs_with_labels_loss_masks.append(self.loss_masks[chunk_id])
+            outputs, loss_func = self.forward_step_func(inputs_with_labels_loss_masks, self.module[phase])
+        else:
+            outputs, loss_func = self.forward_step_func(inputs, self.module[phase])
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage:
-            loss = loss_func(outputs)
+            outputs = outputs[0]
+            loss = loss_func(outputs)[0]
             self.loss_chunks.append(loss)
 
         if self.is_last_rank and phase == 0:
@@ -108,7 +119,7 @@ class DualPipeV(nn.Module):
 
         inputs = self.input_chunks[phase][chunk_id]
         self.input_chunks[phase][chunk_id] = None
-        input_grads = [t.grad for t in inputs]
+        input_grads = [t.grad if t is not None else t for t in inputs]
         if self.is_last_rank and phase == 1:
             self.output_grad_chunks[0].append(input_grads)
         else:
@@ -314,10 +325,16 @@ class DualPipeV(nn.Module):
         if self.is_first_rank:
             from megatron_patch.template.helper import get_batch
             micro_batches = []
+            labels = []
+            loss_masks = []
             for i in range(num_chunks):
                 mb = get_batch(data_iterator)
                 micro_batches.append(mb)
+                labels.append(mb[1])
+                loss_masks.append(mb[2])
             self.input_chunks = (micro_batches, [])
+            self.labels = labels
+            self.loss_masks = loss_masks
 
         # Step 1: nF0
         step_1 = (num_ranks - rank - 1) * 2

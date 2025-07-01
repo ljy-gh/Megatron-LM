@@ -187,7 +187,8 @@ class Float16Module(MegatronModule):
         if mpu.is_pipeline_first_stage():
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
-        if mpu.is_pipeline_last_stage():
+        args = get_args()
+        if mpu.is_pipeline_last_stage() and not args.dualpipev:
             outputs = float16_to_fp32(outputs)
         return outputs
 
