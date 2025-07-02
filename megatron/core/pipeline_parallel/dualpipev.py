@@ -408,7 +408,7 @@ class DualPipeV(nn.Module):
 
         loss = None
         if self.is_first_rank:
-            loss = torch.stack(self.loss_chunks)
+            loss = [{'lm_loss': l} for l in self.loss_chunks]
 
         self._reset_states()
 

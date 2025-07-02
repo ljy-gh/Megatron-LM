@@ -768,7 +768,7 @@ def pretrain(
                                    valid_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train,
-                                   non_loss_data_func=non_loss_data_func)
+                                   non_loss_data_func=non_loss_data_func, dualpipev_model=dualpipev_model)
 
     if args.do_test:
         prefix = f'iteration {iteration} on test set'
@@ -776,7 +776,7 @@ def pretrain(
                                    test_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train,
-                                   non_loss_data_func=non_loss_data_func)
+                                   non_loss_data_func=non_loss_data_func, dualpipev_model=dualpipev_model)
 
     wandb_writer = get_wandb_writer()
     if wandb_writer:
@@ -1210,7 +1210,8 @@ def train_step(forward_step_func, data_iterator,
         optimizer.zero_grad()
 
         # Forward pass.
-        if dualpipev_model is not None:
+        if args.dualpipev:
+            assert dualpipev_model is not None, "dualpipev_model is not provided for training."
             from megatron_patch.template.helper import forward_step_dualpipev
             forward_step_func = forward_step_dualpipev
             losses_reduced = dualpipev_model.step(
@@ -1280,16 +1281,9 @@ def train_step(forward_step_func, data_iterator,
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
         if args.use_distributed_optimizer and args.overlap_param_gather:
             cuda_graph_set_manual_hooks(model)
-
-    if args.dualpipev:
-        if mpu.is_pipeline_first_stage(ignore_virtual=True):
-            loss_reduced = {}
-            loss_reduced['lm_loss'] = (losses_reduced.mean())
-            return loss_reduced, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
-        else:
-            return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
-
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+    
+    if (args.dualpipev and mpu.is_pipeline_first_stage(ignore_virtual=True)) \
+        or (not args.dualpipev and mpu.is_pipeline_last_stage(ignore_virtual=True)):
         # Average loss across microbatches.
         loss_reduced = {}
         for key in losses_reduced[0].keys():
@@ -2054,7 +2048,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, verbose=False, write_to_tensorboard=True,
-                                       non_loss_data_func=non_loss_data_func)
+                                       non_loss_data_func=non_loss_data_func, dualpipev_model=dualpipev_model)
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += args.eval_iters
             timers('eval-time').stop()
@@ -2116,7 +2110,8 @@ def evaluate(forward_step_func,
              process_non_loss_data_func,
              config,
              verbose=False,
-             non_loss_data_func=None):
+             non_loss_data_func=None,
+             dualpipev_model=None):
     """Evaluation."""
     args = get_args()
     timers = get_timers()
@@ -2152,27 +2147,43 @@ def evaluate(forward_step_func,
             if verbose:
                 print_rank_0(f'Evaluating iter {iteration}/{args.eval_iters}')
 
-            forward_backward_func = get_forward_backward_func()
-            # Don't care about timing during evaluation
-            config.timers = None
-            ft_integration.on_eval_step_start()
-            loss_dicts = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
-                forward_only=True)
-            ft_integration.on_eval_step_end()
-            config.timers = get_timers()
+            if args.dualpipev:
+                assert dualpipev_model is not None, "dualpipev_model is not provided for evaluation."
+                from megatron_patch.template.helper import forward_step_dualpipev
+                forward_step_func = forward_step_dualpipev
+                # Don't care about timing during evaluation
+                config.timers = None
+                ft_integration.on_eval_step_start()
+                loss_dicts = dualpipev_model.step(
+                    forward_step_func,
+                    data_iterator,
+                    get_num_microbatches(),
+                )
+                ft_integration.on_eval_step_end()
+                config.timers = get_timers()
+            else:
+                forward_backward_func = get_forward_backward_func()
+                # Don't care about timing during evaluation
+                config.timers = None
+                ft_integration.on_eval_step_start()
+                loss_dicts = forward_backward_func(
+                    forward_step_func=forward_step_func,
+                    data_iterator=data_iterator,
+                    model=model,
+                    num_microbatches=eval_num_microbatches,
+                    seq_length=args.seq_length,
+                    micro_batch_size=args.micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=True)
+                ft_integration.on_eval_step_end()
+                config.timers = get_timers()
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            if (args.dualpipev and mpu.is_pipeline_first_stage(ignore_virtual=True)) \
+                or (not args.dualpipev and mpu.is_pipeline_last_stage(ignore_virtual=True)):
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
@@ -2236,7 +2247,8 @@ def evaluate(forward_step_func,
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
                                iteration, process_non_loss_data_func, config,
-                               verbose=False, write_to_tensorboard=True, non_loss_data_func=None):
+                               verbose=False, write_to_tensorboard=True, non_loss_data_func=None, 
+                               dualpipev_model=None):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
     if write_to_tensorboard:
@@ -2248,7 +2260,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
 
     total_loss_dict, collected_non_loss_data, timelimit = evaluate(
         forward_step_func, data_iterator, model,
-        process_non_loss_data_func, config, verbose, non_loss_data_func)
+        process_non_loss_data_func, config, verbose, non_loss_data_func, dualpipev_model=dualpipev_model)
     # Timelimit hit during evaluation
     if timelimit:
         return
