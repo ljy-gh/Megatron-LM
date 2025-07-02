@@ -364,6 +364,11 @@ def is_rank0():
     return torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
 
 def is_last_rank():
+    args = get_args()
+    if args.dualpipev:
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        num_pp_groups = torch.distributed.get_world_size() // pp_size
+        return torch.distributed.get_rank() == num_pp_groups - 1
     return torch.distributed.get_rank() == (
         torch.distributed.get_world_size() - 1)
 

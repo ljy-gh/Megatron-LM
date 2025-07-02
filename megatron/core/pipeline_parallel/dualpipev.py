@@ -406,7 +406,7 @@ class DualPipeV(nn.Module):
 
         self._commit_and_wait_comm()
 
-        loss, outputs = None, None
+        loss = None
         if self.is_first_rank:
             loss = torch.stack(self.loss_chunks)
 

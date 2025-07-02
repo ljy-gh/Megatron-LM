@@ -1281,6 +1281,14 @@ def train_step(forward_step_func, data_iterator,
         if args.use_distributed_optimizer and args.overlap_param_gather:
             cuda_graph_set_manual_hooks(model)
 
+    if args.dualpipev:
+        if mpu.is_pipeline_first_stage(ignore_virtual=True):
+            loss_reduced = {}
+            loss_reduced['lm_loss'] = (losses_reduced.mean())
+            return loss_reduced, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
+        else:
+            return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
+
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         loss_reduced = {}
