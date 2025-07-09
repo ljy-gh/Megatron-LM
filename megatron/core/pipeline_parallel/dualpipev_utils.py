@@ -20,6 +20,14 @@ def overlapped_forward_backward(
     You should implement custom forward-backward overlap strategy.
     The code below is just an example.
     """
+    # 为当前设备创建专用反向流（首次调用时创建）
+    device = inputs0[0].device
+    if not hasattr(overlapped_forward_backward, 'backward_streams'):
+        overlapped_forward_backward.backward_streams = {}
+    if device not in overlapped_forward_backward.backward_streams:
+        overlapped_forward_backward.backward_streams[device] = torch.cuda.Stream(device=device)
+    backward_stream = overlapped_forward_backward.backward_streams[device]
+
     if len(inputs0) == 1:
         from megatron.core.utils import get_attr_wrapped_model
         set_input_tensor = get_attr_wrapped_model(module0, "set_input_tensor")
@@ -37,11 +45,14 @@ def overlapped_forward_backward(
     else:
         loss0 = None
 
-    if loss1 is not None:
-        loss1.backward()
-        loss1.detach_()
-    else:
-        run_backward(outputs1, output_grads1)
+    with torch.cuda.stream(backward_stream):
+        if loss1 is not None:
+            loss1.backward()
+            loss1.detach_()
+        else:
+            run_backward(outputs1, output_grads1)
+
+    torch.cuda.current_stream().wait_stream(backward_stream)
 
     return outputs0, loss0
 
