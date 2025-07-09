@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 import megatron.core.pipeline_parallel.dualpipev_comm as comm
-from megatron.core.pipeline_parallel.dualpipev_utils import WeightGradStore, run_backward, scatter, gather
+from megatron.core.pipeline_parallel.dualpipev_utils import WeightGradStore, run_backward, overlapped_forward_backward
 
 
 class DualPipeV(nn.Module):
@@ -19,7 +19,7 @@ class DualPipeV(nn.Module):
 
         assert next(modules[0].parameters()).device == torch.device(torch.cuda.current_device())
         self.module = nn.ModuleList(modules)
-        self.overlapped_forward_backward = type(modules[0]) == type(modules[1]) and hasattr(type(modules[0]), "overlapped_forward_backward")
+        self.overlapped_forward_backward = overlapped_forward_backward
         self.group = process_group or dist.distributed_c10d._get_default_group()
         self.num_ranks = self.group.size()
 
@@ -80,8 +80,7 @@ class DualPipeV(nn.Module):
             outputs, loss_func = self.forward_step_func(inputs, self.module[phase])
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage:
-            outputs = outputs[0]
-            loss = loss_func(outputs)[0]
+            loss = loss_func(outputs[0])[0]
             self.loss_chunks.append(loss)
 
         if self.is_last_rank and phase == 0:
@@ -142,17 +141,16 @@ class DualPipeV(nn.Module):
         inputs0 = self.input_chunks[phase0][chunk_id0]
         is_last_stage0 = (self.is_first_rank and phase0 == 1)
 
-        if is_last_stage0 and self.criterion is not None:
+        if is_last_stage0:
             labels0 = self.labels[chunk_id0]
-            criterion0 = self.criterion
+            loss_masks0 = self.loss_masks[chunk_id0]
         else:
             labels0 = []
-            criterion0 = None
+            loss_masks0 = []
 
         # pre-backward
         chunk_id1 = self.current_b_chunk_id[phase1]
         self.current_b_chunk_id[phase1] += 1
-        module1 = self.module[phase1]
         is_last_stage1 = (self.is_first_rank and phase1 == 1)
 
         if is_last_stage1:
@@ -170,9 +168,11 @@ class DualPipeV(nn.Module):
             outputs1, output_grads1 = list(zip(*non_empty))
 
         # forward & backward
-        outputs0, loss0 = type(module0).overlapped_forward_backward(
-            module0, inputs0, criterion0, labels0,
-            module1, loss1, outputs1, output_grads1,
+        outputs0, loss0 = self.overlapped_forward_backward(
+            module0, inputs0, labels0, loss_masks0,
+            loss1, outputs1, output_grads1,
+            self.forward_step_func,
+            is_last_stage0,
         )
 
         # post-forward
@@ -180,13 +180,13 @@ class DualPipeV(nn.Module):
             self.input_chunks[1].append([output.detach().requires_grad_() for output in outputs0])
         if (not is_last_stage0) or self.return_outputs:
             self.output_chunks[phase0].append(outputs0)
-        if is_last_stage0 and self.criterion is not None:
+        if is_last_stage0:
             self.loss_chunks.append(loss0)
 
         # post-backward
         inputs = self.input_chunks[phase1][chunk_id1]
         self.input_chunks[phase1][chunk_id1] = None
-        input_grads1 = [t.grad for t in inputs]
+        input_grads1 = [t.grad if t is not None else t for t in inputs]
         if self.is_last_rank and phase1 == 1:
             self.output_grad_chunks[0].append(input_grads1)
         else:

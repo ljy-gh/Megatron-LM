@@ -1,8 +1,49 @@
 import queue
-from typing import List, Callable
+from typing import List, Callable, Optional
 
 import torch
 from torch.autograd import Variable
+
+
+def overlapped_forward_backward(
+    module0: torch.nn.Module,
+    inputs0: List[torch.Tensor],
+    labels0: Optional[List[torch.Tensor]],
+    loss_masks0: Optional[List[torch.Tensor]],
+    loss1: Optional[torch.Tensor],
+    outputs1: Optional[List[torch.Tensor]],
+    output_grads1: Optional[List[torch.Tensor]],
+    forward_step_func: Callable,
+    is_last_stage0: bool,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    You should implement custom forward-backward overlap strategy.
+    The code below is just an example.
+    """
+    if len(inputs0) == 1:
+        from megatron.core.utils import get_attr_wrapped_model
+        set_input_tensor = get_attr_wrapped_model(module0, "set_input_tensor")
+        set_input_tensor(inputs0)
+    if is_last_stage0:
+        inputs0_with_labels_loss_masks = list(inputs0)
+        inputs0_with_labels_loss_masks.append(labels0)
+        inputs0_with_labels_loss_masks.append(loss_masks0)
+        outputs0, loss_func = forward_step_func(inputs0_with_labels_loss_masks, module0)
+    else:
+        outputs0, loss_func = forward_step_func(inputs0, module0)
+    outputs0 = [outputs0] if isinstance(outputs0, torch.Tensor) else outputs0
+    if is_last_stage0:
+        loss0 = loss_func(outputs0[0])[0]
+    else:
+        loss0 = None
+
+    if loss1 is not None:
+        loss1.backward()
+        loss1.detach_()
+    else:
+        run_backward(outputs1, output_grads1)
+
+    return outputs0, loss0
 
 
 class WeightGradStore:
