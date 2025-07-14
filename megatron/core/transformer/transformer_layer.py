@@ -363,7 +363,45 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             "Please use get_transformer_layer_offset instead."
         )
         return get_transformer_layer_offset(config)
+    
+    def attention_forward(self, *args, **kwargs):
+        pre_mlp_layernorm_output, residual, context = self._forward_attention(*args, **kwargs)
+        permutated_local_input_tokens, tokens_per_expert = self.mlp.pre_moe(pre_mlp_layernorm_output)
+        return permutated_local_input_tokens, tokens_per_expert, residual, context
+    
+    def dispatch(self, permutated_local_input_tokens: torch.Tensor):
+        global_input_tokens = self.mlp.dispatch_tokens(permutated_local_input_tokens)
+        return global_input_tokens
+    
+    def moe_forward(self, global_input_tokens: torch.Tensor, tokens_per_expert: torch.Tensor):
+        hidden_states = self.mlp.moe_forward(global_input_tokens, tokens_per_expert)
+        return hidden_states
+    
+    def combine(self, hidden_states: torch.Tensor):
+        permutated_local_input_tokens = self.mlp.combine_tokens(hidden_states)
+        return permutated_local_input_tokens
+    
+    def moe_post(self, permutated_local_input_tokens: torch.Tensor, residual: torch.Tensor):
+        mlp_output_with_bias = self.mlp.post_moe(permutated_local_input_tokens, residual)
+        # TODO: could we move `bias_dropout_add_exec_handler` itself
+        # inside the module provided in the `bias_dropout_add_spec` module?
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                mlp_output_with_bias, residual, self.hidden_dropout
+            )
 
+        # Jit compiled function creates 'view' tensor. This tensor
+        # potentially gets saved in the MPU checkpoint function context,
+        # which rejects view tensors. While making a viewless tensor here
+        # won't result in memory savings (like the data loader, or
+        # p2p_communication), it serves to document the origin of this
+        # 'view' tensor.
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        return output
+    
     def forward(self, *args, **kwargs):
         """
         Perform a forward pass through the transformer layer.
@@ -371,9 +409,23 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        pre_mlp_layernorm_output, residual, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(pre_mlp_layernorm_output, residual)
+        permutated_local_input_tokens, tokens_per_expert, residual, context = self.attention_forward(*args, **kwargs)
+        global_input_tokens = self.dispatch(permutated_local_input_tokens)
+        hidden_states = self.moe_forward(global_input_tokens, tokens_per_expert)
+        permutated_local_input_tokens = self.combine(hidden_states)
+        output = self.moe_post(permutated_local_input_tokens, residual)
         return output, context
+    
+    # def forward(self, *args, **kwargs):
+    #     """
+    #     Perform a forward pass through the transformer layer.
+
+    #     This method calls the core computation of a transformer layer, including
+    #     self-attention, cross-attention (if applicable), and feed-forward operations.
+    #     """
+    #     pre_mlp_layernorm_output, residual, context = self._forward_attention(*args, **kwargs)
+    #     output = self._forward_mlp(pre_mlp_layernorm_output, residual)
+    #     return output, context
 
     def _forward_attention(
         self,

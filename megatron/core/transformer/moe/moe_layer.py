@@ -118,6 +118,43 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
+    def pre_moe(self, hidden_states: torch.Tensor):
+        probs, routing_map = self.router(hidden_states)
+        permutated_local_input_tokens, tokens_per_expert = self.token_dispatcher.token_permutation_pre(
+            hidden_states, probs, routing_map
+        )
+        return permutated_local_input_tokens, tokens_per_expert
+    
+    def dispatch_tokens(self, permutated_local_input_tokens: torch.Tensor):
+        global_input_tokens = self.token_dispatcher.token_permutation_alltoall(permutated_local_input_tokens)
+        return global_input_tokens
+    
+    def moe_forward(self, global_input_tokens: torch.Tensor, tokens_per_expert: torch.Tensor):
+        dispatched_input, tokens_per_expert = self.token_dispatcher.token_permutation_post(global_input_tokens, tokens_per_expert)
+        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
+        hidden_states = self.token_dispatcher.token_unpermutation_pre(expert_output, mlp_bias)
+        return hidden_states
+    
+    def combine_tokens(self, hidden_states: torch.Tensor):
+        permutated_local_input_tokens = self.token_dispatcher.token_unpermutation_alltoall(hidden_states)
+        return permutated_local_input_tokens
+    
+    def post_moe(self, permutated_local_input_tokens: torch.Tensor, original_hidden_states: torch.Tensor):
+        output, mlp_bias = self.token_dispatcher.token_unpermutation_post(permutated_local_input_tokens)
+        if self.use_shared_expert and not self.shared_expert_overlap:
+            # if shared_expert_overlap is True, the expert calculation happens in
+            # the token_dispatcher to overlap communications and computations
+            output = output + self.shared_experts(original_hidden_states)
+        return output, mlp_bias
+
+    def forward_copy(self, hidden_states: torch.Tensor):
+        original_hidden_states = hidden_states
+        permutated_local_input_tokens, tokens_per_expert = self.pre_moe(hidden_states)
+        global_input_tokens = self.dispatch_tokens(permutated_local_input_tokens)
+        hidden_states = self.moe_forward(global_input_tokens, tokens_per_expert)
+        permutated_local_input_tokens = self.combine_tokens(hidden_states)
+        return self.post_moe(permutated_local_input_tokens, original_hidden_states)
+
     def forward(self, hidden_states: torch.Tensor):
         if (
             self.training
