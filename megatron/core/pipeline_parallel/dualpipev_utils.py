@@ -10,11 +10,14 @@ def overlapped_forward_backward(
     inputs0: List[torch.Tensor],
     labels0: Optional[List[torch.Tensor]],
     loss_masks0: Optional[List[torch.Tensor]],
+    module1: torch.nn.Module,
     loss1: Optional[torch.Tensor],
     outputs1: Optional[List[torch.Tensor]],
     output_grads1: Optional[List[torch.Tensor]],
     forward_step_func: Callable,
     is_last_stage0: bool,
+    chunk_id0: int,
+    chunk_id1: int,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     You should implement custom forward-backward overlap strategy.
@@ -28,9 +31,9 @@ def overlapped_forward_backward(
         inputs0_with_labels_loss_masks = list(inputs0)
         inputs0_with_labels_loss_masks.append(labels0)
         inputs0_with_labels_loss_masks.append(loss_masks0)
-        outputs0, loss_func = forward_step_func(inputs0_with_labels_loss_masks, module0)
+        outputs0, loss_func = forward_step_func(inputs0_with_labels_loss_masks, module0, chunk_id0)
     else:
-        outputs0, loss_func = forward_step_func(inputs0, module0)
+        outputs0, loss_func = forward_step_func(inputs0, module0, chunk_id0)
     outputs0 = [outputs0] if isinstance(outputs0, torch.Tensor) else outputs0
     if is_last_stage0:
         loss0 = loss_func(outputs0[0])[0]
@@ -38,10 +41,9 @@ def overlapped_forward_backward(
         loss0 = None
 
     if loss1 is not None:
-        loss1.backward()
-        loss1.detach_()
+        module1.backward(loss1, None, chunk_id1)
     else:
-        run_backward(outputs1, output_grads1)
+        module1.backward(None, output_grads1, chunk_id1)
 
     return outputs0, loss0
 

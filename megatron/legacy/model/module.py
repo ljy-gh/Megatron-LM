@@ -192,6 +192,8 @@ class Float16Module(MegatronModule):
             outputs = float16_to_fp32(outputs)
         return outputs
 
+    def backward(self, loss, output_grad, chunk_id):
+        self.module.backward(loss, output_grad, chunk_id)
 
     def state_dict(self, prefix='', keep_vars=False):
         return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)

@@ -75,9 +75,9 @@ class DualPipeV(nn.Module):
             inputs_with_labels_loss_masks = list(inputs)
             inputs_with_labels_loss_masks.append(self.labels[chunk_id])
             inputs_with_labels_loss_masks.append(self.loss_masks[chunk_id])
-            outputs, loss_func = self.forward_step_func(inputs_with_labels_loss_masks, self.module[phase])
+            outputs, loss_func = self.forward_step_func(inputs_with_labels_loss_masks, self.module[phase], chunk_id)
         else:
-            outputs, loss_func = self.forward_step_func(inputs, self.module[phase])
+            outputs, loss_func = self.forward_step_func(inputs, self.module[phase], chunk_id)
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage:
             loss = loss_func(outputs[0])[0]
@@ -100,8 +100,7 @@ class DualPipeV(nn.Module):
         WeightGradStore.enabled = enable_zb
         if is_last_stage:
             loss = self.loss_chunks[chunk_id]
-            loss.backward()
-            loss.detach_()
+            self.module[phase].backward(loss, None, chunk_id)
         else:
             outputs = self.output_chunks[phase][chunk_id]
             if not self.return_outputs:
@@ -111,7 +110,7 @@ class DualPipeV(nn.Module):
             non_empty = [(t, g) for t, g in zip(outputs, output_grads) if g is not None]
             outputs, output_grads = list(zip(*non_empty))
             if len(outputs) > 0:
-                run_backward(outputs, output_grads)
+                self.module[phase].backward(None, output_grads, chunk_id)
         WeightGradStore.enabled = False
         if enable_zb:
             WeightGradStore.flush()
@@ -149,6 +148,7 @@ class DualPipeV(nn.Module):
             loss_masks0 = []
 
         # pre-backward
+        module1 = self.module[phase1]
         chunk_id1 = self.current_b_chunk_id[phase1]
         self.current_b_chunk_id[phase1] += 1
         is_last_stage1 = (self.is_first_rank and phase1 == 1)
@@ -170,9 +170,11 @@ class DualPipeV(nn.Module):
         # forward & backward
         outputs0, loss0 = self.overlapped_forward_backward(
             module0, inputs0, labels0, loss_masks0,
-            loss1, outputs1, output_grads1,
+            module1, loss1, outputs1, output_grads1,
             self.forward_step_func,
             is_last_stage0,
+            chunk_id0,
+            chunk_id1,
         )
 
         # post-forward

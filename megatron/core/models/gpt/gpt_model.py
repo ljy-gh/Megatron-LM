@@ -216,6 +216,11 @@ class GPTModel(LanguageModule):
                 self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
             )
 
+        # Cache decoder outputs
+        from megatron.core.num_microbatches_calculator import get_num_microbatches
+        num_microbatches = get_num_microbatches()
+        self.decoder_outputs = [None for _ in range(num_microbatches)]
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -246,6 +251,7 @@ class GPTModel(LanguageModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        chunk_id: int = -1,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -259,6 +265,7 @@ class GPTModel(LanguageModule):
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+        assert chunk_id >= 0, "chunk_id must be set."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -330,8 +337,12 @@ class GPTModel(LanguageModule):
             rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            chunk_id=chunk_id,
             **(extra_block_kwargs or {}),
         )
+        hidden_states = hidden_states.detach().clone()
+        hidden_states.requires_grad = True
+        self.decoder_outputs[chunk_id] = hidden_states
 
         # Process inference output.
         if inference_context and not inference_context.is_static_batching():
@@ -399,6 +410,16 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    def backward(self, loss, output_grad, chunk_id):
+        if loss is not None:
+            loss.backward()
+            loss.detach_()
+            output_grad = self.decoder_outputs[chunk_id].grad
+            self.decoder.backward(output_grad, chunk_id)
+        else:
+            self.decoder.backward(output_grad, chunk_id)
+        self.decoder_outputs[chunk_id] = None
 
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share input embedding and

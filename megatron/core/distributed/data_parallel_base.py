@@ -21,6 +21,9 @@ class _BaseDataParallel(MegatronModule):
         """
         return self.module(*inputs, **kwargs)
 
+    def backward(self, loss, output_grad, chunk_id):
+        self.module.backward(loss, output_grad, chunk_id)
+
     @contextmanager
     def no_sync(self):
         """

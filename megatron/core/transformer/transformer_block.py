@@ -410,6 +410,7 @@ class TransformerBlock(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        chunk_id: int = -1,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -437,6 +438,7 @@ class TransformerBlock(MegatronModule):
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
+        assert chunk_id >= 0, "chunk_id must be set."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -511,6 +513,7 @@ class TransformerBlock(MegatronModule):
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
+                            chunk_id=chunk_id,
                         )
 
                     if (
@@ -531,6 +534,10 @@ class TransformerBlock(MegatronModule):
             )
 
         return hidden_states
+
+    def backward(self, output_grad, chunk_id):
+        for layer in reversed(self.layers):
+            output_grad = layer.backward(output_grad, chunk_id)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
