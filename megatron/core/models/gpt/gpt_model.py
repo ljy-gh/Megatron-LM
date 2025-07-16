@@ -340,7 +340,7 @@ class GPTModel(LanguageModule):
             chunk_id=chunk_id,
             **(extra_block_kwargs or {}),
         )
-        hidden_states = hidden_states.detach().clone()
+        hidden_states = hidden_states.detach()
         hidden_states.requires_grad = True
         self.decoder_outputs[chunk_id] = hidden_states
 

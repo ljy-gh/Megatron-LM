@@ -386,24 +386,61 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         return get_transformer_layer_offset(config)
     
     def attention_forward(self, *args, **kwargs):
+        self.input = kwargs['hidden_states']
+        chunk_id = kwargs['chunk_id']
+        assert chunk_id >= 0, "chunk_id must be set."
+        kwargs.pop('chunk_id')
+        self.chunk_id = chunk_id
+
         pre_mlp_layernorm_output, residual, context = self._forward_attention(*args, **kwargs)
         permutated_local_input_tokens, tokens_per_expert = self.mlp.pre_moe(pre_mlp_layernorm_output)
-        return permutated_local_input_tokens, tokens_per_expert, residual, context
+
+        permutated_local_input_tokens_detached = permutated_local_input_tokens.detach()
+        permutated_local_input_tokens_detached.requires_grad = True
+        residual_detached = residual.detach()
+        residual_detached.requires_grad = True
+        self.permutated_local_input_tokens[chunk_id] = permutated_local_input_tokens
+        self.permutated_local_input_tokens_detached[chunk_id] = permutated_local_input_tokens_detached
+        self.residual[chunk_id] = residual
+        self.residual_detached[chunk_id] = residual_detached
+
+        self.tokens_per_expert = tokens_per_expert
+        self.context = context
     
-    def dispatch(self, permutated_local_input_tokens: torch.Tensor):
+    def dispatch(self,):
+        permutated_local_input_tokens = self.permutated_local_input_tokens_detached[self.chunk_id]
         global_input_tokens = self.mlp.dispatch_tokens(permutated_local_input_tokens)
-        return global_input_tokens
+
+        global_input_tokens_detached = global_input_tokens.detach()
+        global_input_tokens_detached.requires_grad = True
+        self.global_input_tokens[self.chunk_id] = global_input_tokens
+        self.global_input_tokens_detached[self.chunk_id] = global_input_tokens_detached
     
-    def moe_forward(self, global_input_tokens: torch.Tensor, tokens_per_expert: torch.Tensor):
+    def moe_forward(self,):
+        global_input_tokens = self.global_input_tokens_detached[self.chunk_id]
+        tokens_per_expert = self.tokens_per_expert
+
         hidden_states = self.mlp.moe_forward(global_input_tokens, tokens_per_expert)
-        return hidden_states
+
+        hidden_states_detached = hidden_states.detach()
+        hidden_states_detached.requires_grad = True
+        self.hidden_states[self.chunk_id] = hidden_states
+        self.hidden_states_detached[self.chunk_id] = hidden_states_detached
     
-    def combine(self, hidden_states: torch.Tensor):
-        permutated_local_input_tokens = self.mlp.combine_tokens(hidden_states)
-        return permutated_local_input_tokens
+    def combine(self,):
+        hidden_states = self.hidden_states_detached[self.chunk_id]
+        unpermutated_local_input_tokens = self.mlp.combine_tokens(hidden_states)
+        
+        unpermutated_local_input_tokens_detached = unpermutated_local_input_tokens.detach()
+        unpermutated_local_input_tokens_detached.requires_grad = True
+        self.unpermutated_local_input_tokens[self.chunk_id] = unpermutated_local_input_tokens
+        self.unpermutated_local_input_tokens_detached[self.chunk_id] = unpermutated_local_input_tokens_detached  
     
-    def moe_post(self, permutated_local_input_tokens: torch.Tensor, residual: torch.Tensor):
-        mlp_output_with_bias = self.mlp.post_moe(permutated_local_input_tokens, residual)
+    def moe_post(self,):
+        unpermutated_local_input_tokens = self.unpermutated_local_input_tokens_detached[self.chunk_id]
+        residual = self.residual_detached[self.chunk_id]
+
+        mlp_output_with_bias = self.mlp.post_moe(unpermutated_local_input_tokens, residual)
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
@@ -421,7 +458,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        return output
+        self.output[self.chunk_id] = output
+        return output, self.context
     
     def forward(self, *args, **kwargs):
         """
@@ -430,66 +468,46 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        self.input = kwargs['hidden_states']
-        chunk_id = kwargs['chunk_id']
-        assert chunk_id >= 0, "chunk_id must be set."
-        kwargs.pop('chunk_id')
+        self.attention_forward(*args, **kwargs)
+        self.dispatch()
+        self.moe_forward()
+        self.combine()
+        return self.moe_post()
 
-        permutated_local_input_tokens, tokens_per_expert, residual, context = self.attention_forward(*args, **kwargs)
-        permutated_local_input_tokens_detached = permutated_local_input_tokens.detach().clone()
-        permutated_local_input_tokens_detached.requires_grad = True
-        residual_detached = residual.detach().clone()
-        residual_detached.requires_grad = True
-        self.permutated_local_input_tokens[chunk_id] = permutated_local_input_tokens
-        self.permutated_local_input_tokens_detached[chunk_id] = permutated_local_input_tokens_detached
-        self.residual[chunk_id] = residual
-        self.residual_detached[chunk_id] = residual_detached
-        
-        global_input_tokens = self.dispatch(permutated_local_input_tokens_detached)
-        global_input_tokens_detached = global_input_tokens.detach().clone()
-        global_input_tokens_detached.requires_grad = True
-        self.global_input_tokens[chunk_id] = global_input_tokens
-        self.global_input_tokens_detached[chunk_id] = global_input_tokens_detached
-
-        hidden_states = self.moe_forward(global_input_tokens_detached, tokens_per_expert)
-        hidden_states_detached = hidden_states.detach().clone()
-        hidden_states_detached.requires_grad = True
-        self.hidden_states[chunk_id] = hidden_states
-        self.hidden_states_detached[chunk_id] = hidden_states_detached
-
-        unpermutated_local_input_tokens = self.combine(hidden_states_detached)
-        unpermutated_local_input_tokens_detached = unpermutated_local_input_tokens.detach().clone()
-        unpermutated_local_input_tokens_detached.requires_grad = True
-        self.unpermutated_local_input_tokens[chunk_id] = unpermutated_local_input_tokens
-        self.unpermutated_local_input_tokens_detached[chunk_id] = unpermutated_local_input_tokens_detached    
-        
-        output = self.moe_post(unpermutated_local_input_tokens_detached, residual_detached)
-        self.output[chunk_id] = output
-        return output, context
-
-    def backward(self, output_grad, chunk_id):
+    def moe_post_backward(self, output_grad, chunk_id):
+        self.chunk_id = chunk_id
         torch.autograd.backward(self.output[chunk_id], output_grad, retain_graph=True)
         self.output[chunk_id] = None
 
-        torch.autograd.backward(self.unpermutated_local_input_tokens[chunk_id], self.unpermutated_local_input_tokens_detached[chunk_id].grad)
-        self.unpermutated_local_input_tokens[chunk_id] = None
-        self.unpermutated_local_input_tokens_detached[chunk_id] = None
+    def combine_backward(self,):
+        torch.autograd.backward(self.unpermutated_local_input_tokens[self.chunk_id], self.unpermutated_local_input_tokens_detached[self.chunk_id].grad)
+        self.unpermutated_local_input_tokens[self.chunk_id] = None
+        self.unpermutated_local_input_tokens_detached[self.chunk_id] = None
 
-        torch.autograd.backward(self.hidden_states[chunk_id], self.hidden_states_detached[chunk_id].grad)
-        self.hidden_states[chunk_id] = None
-        self.hidden_states_detached[chunk_id] = None
+    def moe_backward(self,):
+        torch.autograd.backward(self.hidden_states[self.chunk_id], self.hidden_states_detached[self.chunk_id].grad)
+        self.hidden_states[self.chunk_id] = None
+        self.hidden_states_detached[self.chunk_id] = None
 
-        torch.autograd.backward(self.global_input_tokens[chunk_id], self.global_input_tokens_detached[chunk_id].grad)
-        self.global_input_tokens[chunk_id] = None
-        self.global_input_tokens_detached[chunk_id] = None
+    def dispatch_backward(self,):
+        torch.autograd.backward(self.global_input_tokens[self.chunk_id], self.global_input_tokens_detached[self.chunk_id].grad)
+        self.global_input_tokens[self.chunk_id] = None
+        self.global_input_tokens_detached[self.chunk_id] = None
 
-        torch.autograd.backward([self.residual[chunk_id], self.permutated_local_input_tokens[chunk_id]], [self.residual_detached[chunk_id].grad, self.permutated_local_input_tokens_detached[chunk_id].grad])
-        self.residual[chunk_id] = None
-        self.residual_detached[chunk_id] = None
-        self.permutated_local_input_tokens[chunk_id] = None
-        self.permutated_local_input_tokens_detached[chunk_id] = None
-
+    def attention_backward(self,):
+        torch.autograd.backward([self.residual[self.chunk_id], self.permutated_local_input_tokens[self.chunk_id]], [self.residual_detached[self.chunk_id].grad, self.permutated_local_input_tokens_detached[self.chunk_id].grad])
+        self.residual[self.chunk_id] = None
+        self.residual_detached[self.chunk_id] = None
+        self.permutated_local_input_tokens[self.chunk_id] = None
+        self.permutated_local_input_tokens_detached[self.chunk_id] = None
         return self.input.grad
+
+    def backward(self, output_grad, chunk_id):
+        self.moe_post_backward(output_grad, chunk_id)
+        self.combine_backward()
+        self.moe_backward()
+        self.dispatch_backward()
+        return self.attention_backward()
     
     # def forward(self, *args, **kwargs):
     #     """
