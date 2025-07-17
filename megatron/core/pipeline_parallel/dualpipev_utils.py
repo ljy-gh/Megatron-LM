@@ -23,6 +23,7 @@ def overlapped_forward_backward(
     You should implement custom forward-backward overlap strategy.
     The code below is just an example.
     """
+    # Prepare inputs for forward
     if len(inputs0) == 1:
         from megatron.core.utils import get_attr_wrapped_model
         set_input_tensor = get_attr_wrapped_model(module0, "set_input_tensor")
@@ -31,38 +32,36 @@ def overlapped_forward_backward(
         inputs0_with_labels_loss_masks = list(inputs0)
         inputs0_with_labels_loss_masks.append(labels0)
         inputs0_with_labels_loss_masks.append(loss_masks0)
-        loss_func = attention_forward(inputs0_with_labels_loss_masks, module0, chunk_id0)
-        module0.dispatch()
-        module0.moe_forward()
-        module0.combine()
-        outputs0 = module0.moe_post()
+        final_inputs0 = (inputs0_with_labels_loss_masks, module0, chunk_id0)
     else:
-        loss_func = attention_forward(inputs0, module0, chunk_id0)
-        module0.dispatch()
-        module0.moe_forward()
-        module0.combine()
-        outputs0 = module0.moe_post()
+        final_inputs0 = (inputs0, module0, chunk_id0)
 
+    # Prepare inputs for backward
+    if loss1 is not None:
+        final_inputs1 = (loss1, None, chunk_id1)
+    else:
+        final_inputs1 = (None, output_grads1, chunk_id1)
+
+    # forward
+    loss_func = attention_forward(*final_inputs0)
+    module0.dispatch()
+    module0.moe_forward()
+    module0.combine()
+    outputs0 = module0.moe_post()
+
+    # backward
+    module1.moe_post_backward(*final_inputs1)
+    module1.combine_backward()
+    module1.moe_backward()
+    module1.dispatch_backward()
+    module1.attention_backward()
+
+    # post-process
     outputs0 = [outputs0] if isinstance(outputs0, torch.Tensor) else outputs0
     if is_last_stage0:
         loss0 = loss_func(outputs0[0])[0]
     else:
         loss0 = None
-
-    if loss1 is not None:
-        # module1.backward(loss1, None, chunk_id1)
-        module1.moe_post_backward(loss1, None, chunk_id1)
-        module1.combine_backward()
-        module1.moe_backward()
-        module1.dispatch_backward()
-        module1.attention_backward()
-    else:
-        # module1.backward(None, output_grads1, chunk_id1)
-        module1.moe_post_backward(None, output_grads1, chunk_id1)
-        module1.combine_backward()
-        module1.moe_backward()
-        module1.dispatch_backward()
-        module1.attention_backward()
 
     return outputs0, loss0
 
