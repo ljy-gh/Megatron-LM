@@ -5,6 +5,8 @@ import torch
 from torch.autograd import Variable
 from megatron_patch.template.helper import attention_forward
 
+forward_stream = torch.cuda.Stream()
+backward_stream = torch.cuda.Stream()
 
 def overlapped_forward_backward(
     module0: torch.nn.Module,
@@ -42,19 +44,50 @@ def overlapped_forward_backward(
     else:
         final_inputs1 = (None, output_grads1, chunk_id1)
 
-    # forward
-    loss_func = attention_forward(*final_inputs0)
-    module0.dispatch()
-    module0.moe_forward()
-    module0.combine()
-    outputs0 = module0.moe_post()
+    if torch.distributed.get_rank() == 0:
+        print()
+    import time
+    start_time = time.perf_counter()
 
-    # backward
-    module1.moe_post_backward(*final_inputs1)
-    module1.combine_backward()
-    module1.moe_backward()
-    module1.dispatch_backward()
+    global forward_stream
+    global backward_stream
+
+    loss_func = attention_forward(*final_inputs0)
+
+    with torch.cuda.stream(forward_stream):
+        module0.dispatch()
+    with torch.cuda.stream(backward_stream):
+        module1.moe_post_backward(*final_inputs1)
+    torch.cuda.current_stream().wait_stream(forward_stream)
+    torch.cuda.current_stream().wait_stream(backward_stream)
+
+    with torch.cuda.stream(forward_stream):
+        module0.moe_forward()
+    with torch.cuda.stream(backward_stream):
+        module1.combine_backward()
+    torch.cuda.current_stream().wait_stream(forward_stream)
+    torch.cuda.current_stream().wait_stream(backward_stream)
+
+    with torch.cuda.stream(forward_stream):
+        module0.combine()
+    with torch.cuda.stream(backward_stream):
+        module1.moe_backward()
+    torch.cuda.current_stream().wait_stream(forward_stream)
+    torch.cuda.current_stream().wait_stream(backward_stream)
+
+    with torch.cuda.stream(forward_stream):
+        outputs0 = module0.moe_post()
+    with torch.cuda.stream(backward_stream):
+        module1.dispatch_backward()
+    torch.cuda.current_stream().wait_stream(forward_stream)
+    torch.cuda.current_stream().wait_stream(backward_stream)
+
     module1.attention_backward()
+
+    end_time = time.perf_counter()
+    if torch.distributed.get_rank() == 0:
+        print(f"Time taken: {end_time - start_time} seconds")
+        print()
 
     # post-process
     outputs0 = [outputs0] if isinstance(outputs0, torch.Tensor) else outputs0
