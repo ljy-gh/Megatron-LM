@@ -411,6 +411,186 @@ class GPTModel(LanguageModule):
 
         return loss
 
+    def attention_forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+        chunk_id: int = -1,
+    ) -> Tensor:
+        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
+        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+        assert chunk_id >= 0, "chunk_id must be set."
+        self.chunk_id = chunk_id
+        self.runtime_gather_output = runtime_gather_output
+        self.labels = labels
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        self.inference_context = inference_context
+
+        # Decoder embedding.
+        if decoder_input is not None:
+            pass
+        elif self.pre_process:
+            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+        else:
+            # intermediate stage of pipeline
+            # decoder will get hidden_states from encoder.input_tensor
+            decoder_input = None
+
+        # Rotary positional embeddings (embedding is None for PP intermediate devices)
+        rotary_pos_emb = None
+        rotary_pos_cos = None
+        rotary_pos_sin = None
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            if not self.training and self.config.flash_decode and inference_context:
+                assert (
+                    inference_context.is_static_batching()
+                ), "GPTModel currently only supports static inference batching."
+                # Flash decoding uses precomputed cos and sin for RoPE
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
+                    inference_context.max_sequence_length,
+                    self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                )
+            else:
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                rotary_pos_emb = self.rotary_pos_emb(
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                )
+        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+            if self.training or not self.config.flash_decode:
+                rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section)
+            else:
+                # Flash decoding uses precomputed cos and sin for RoPE
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implmented in "
+                    "MultimodalRotaryEmbedding yet."
+                )
+
+        if (
+            (self.config.enable_cuda_graph or self.config.flash_decode)
+            and rotary_pos_cos is not None
+            and inference_context
+            and inference_context.is_static_batching()
+            and not self.training
+        ):
+            sequence_len_offset = torch.tensor(
+                [inference_context.sequence_len_offset] * inference_context.current_batch_size,
+                dtype=torch.int32,
+                device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
+            )
+        else:
+            sequence_len_offset = None
+
+        self.decoder.attention_forward(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            chunk_id=chunk_id,
+            **(extra_block_kwargs or {}),
+        )
+
+    def dispatch(self,):
+        self.decoder.dispatch()
+
+    def moe_forward(self,):
+        self.decoder.moe_forward()
+    
+    def combine(self,):
+        self.decoder.combine()
+
+    def moe_post(self,):
+        hidden_states = self.decoder.moe_post()
+
+        hidden_states = hidden_states.detach()
+        hidden_states.requires_grad = True
+        self.decoder_outputs[self.chunk_id] = hidden_states
+
+        # Process inference output.
+        if self.inference_context and not self.inference_context.is_static_batching():
+            hidden_states = self.inference_context.last_token_logits(
+                hidden_states.squeeze(1).unsqueeze(0)
+            ).unsqueeze(1)
+
+        # logits and loss
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        if self.mtp_process:
+            hidden_states = self.mtp(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_params=self.inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                embedding=self.embedding,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                compute_language_model_loss=self.compute_language_model_loss,
+                **(extra_block_kwargs or {}),
+            )
+
+        if not self.post_process:
+            return hidden_states
+
+        if (
+            not self.training
+            and self.inference_context is not None
+            and self.inference_context.is_static_batching()
+            and self.inference_context.materialize_only_last_token_logits
+        ):
+            hidden_states = hidden_states[-1:, :, :]
+        logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=self.runtime_gather_output
+        )
+
+        if has_config_logger_enabled(self.config):
+            payload = OrderedDict(
+                {
+                    'input_ids': input_ids,
+                    'position_ids': position_ids,
+                    'attention_mask': attention_mask,
+                    'decoder_input': decoder_input,
+                    'logits': logits,
+                }
+            )
+            log_config_to_disk(self.config, payload, prefix='input_and_logits')
+
+        if self.labels is None:
+            # [s b h] => [b s h]
+            return logits.transpose(0, 1).contiguous()
+
+        loss = self.compute_language_model_loss(self.labels, logits)
+
+        return loss
+
     def backward(self, loss, output_grad, chunk_id):
         if loss is not None:
             loss.backward()
@@ -421,6 +601,28 @@ class GPTModel(LanguageModule):
             self.decoder.backward(output_grad, chunk_id)
         self.decoder_outputs[chunk_id] = None
 
+    def moe_post_backward(self, loss, output_grad, chunk_id):
+        if loss is not None:
+            loss.backward()
+            loss.detach_()
+            output_grad = self.decoder_outputs[chunk_id].grad
+            self.decoder.moe_post_backward(output_grad, chunk_id)
+        else:
+            self.decoder.moe_post_backward(output_grad, chunk_id)
+        self.decoder_outputs[chunk_id] = None
+
+    def combine_backward(self,):
+        self.decoder.combine_backward()
+
+    def moe_backward(self,):
+        self.decoder.moe_backward()
+
+    def dispatch_backward(self,):
+        self.decoder.dispatch_backward()
+
+    def attention_backward(self,):
+        return self.decoder.attention_backward()
+        
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share input embedding and
         output weights set to True or when use Multi-Token Prediction (MTP) feature.

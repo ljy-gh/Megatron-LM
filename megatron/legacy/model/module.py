@@ -192,8 +192,44 @@ class Float16Module(MegatronModule):
             outputs = float16_to_fp32(outputs)
         return outputs
 
+    def attention_forward(self, *inputs, **kwargs):
+        if mpu.is_pipeline_first_stage():
+            inputs = fp32_to_float16(inputs, self.float16_convertor)
+        self.module.attention_forward(*inputs, **kwargs)
+
+    def dispatch(self,):
+        self.module.dispatch()
+
+    def moe_forward(self,):
+        self.module.moe_forward()
+
+    def combine(self,):
+        self.module.combine()
+
+    def moe_post(self,):
+        outputs = self.module.moe_post()
+        args = get_args()
+        if mpu.is_pipeline_last_stage() and not args.dualpipev:
+            outputs = float16_to_fp32(outputs)
+        return outputs
+
     def backward(self, loss, output_grad, chunk_id):
         self.module.backward(loss, output_grad, chunk_id)
+
+    def moe_post_backward(self, loss, output_grad, chunk_id):
+        self.module.moe_post_backward(loss, output_grad, chunk_id)
+
+    def combine_backward(self,):
+        self.module.combine_backward()
+
+    def moe_backward(self,):
+        self.module.moe_backward()
+
+    def dispatch_backward(self,):
+        self.module.dispatch_backward()
+
+    def attention_backward(self,):
+        return self.module.attention_backward()
 
     def state_dict(self, prefix='', keep_vars=False):
         return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)

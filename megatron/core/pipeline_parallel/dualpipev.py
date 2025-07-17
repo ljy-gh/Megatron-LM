@@ -171,7 +171,6 @@ class DualPipeV(nn.Module):
         outputs0, loss0 = self.overlapped_forward_backward(
             module0, inputs0, labels0, loss_masks0,
             module1, loss1, outputs1, output_grads1,
-            self.forward_step_func,
             is_last_stage0,
             chunk_id0,
             chunk_id1,

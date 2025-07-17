@@ -21,8 +21,38 @@ class _BaseDataParallel(MegatronModule):
         """
         return self.module(*inputs, **kwargs)
 
+    def attention_forward(self, *inputs, **kwargs):
+        self.module.attention_forward(*inputs, **kwargs)
+
+    def dispatch(self,):
+        self.module.dispatch()  
+
+    def moe_forward(self,):
+        self.module.moe_forward()
+
+    def combine(self,):
+        self.module.combine()
+
+    def moe_post(self,):
+        return self.module.moe_post()
+
     def backward(self, loss, output_grad, chunk_id):
         self.module.backward(loss, output_grad, chunk_id)
+
+    def moe_post_backward(self, loss, output_grad, chunk_id):
+        self.module.moe_post_backward(loss, output_grad, chunk_id)
+
+    def combine_backward(self,):
+        self.module.combine_backward()  
+
+    def moe_backward(self,):
+        self.module.moe_backward()
+
+    def dispatch_backward(self,):
+        self.module.dispatch_backward()
+
+    def attention_backward(self,):
+        self.module.attention_backward()
 
     @contextmanager
     def no_sync(self):

@@ -535,9 +535,171 @@ class TransformerBlock(MegatronModule):
 
         return hidden_states
 
+    def attention_forward(self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor],
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        chunk_id: int = -1,
+    ):
+        assert chunk_id >= 0, "chunk_id must be set."
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if not self.pre_process:
+            # See set_input_tensor()
+            hidden_states = self.input_tensor
+
+        # Update the inference parameters with the current batch size in case it is variable
+        if inference_context and not self.training:
+            inference_context.current_batch_size = hidden_states.size(1)
+
+        # Viewless tensor.
+        # - We only need to create a viewless tensor in the case of micro batch
+        #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
+        #   above creates a view tensor, and '.contiguous()' is a pass-through.
+        #   For mbs >= 2, '.contiguous()' creates a new tensor, eliminating
+        #   the need to make it viewless.
+        #
+        #   However, we don't explicitly check mbs == 1 here because
+        #   make_viewless_tensor() has negligible overhead when its input
+        #   is already viewless.
+        #
+        # - For the 'else' case above, calling make_viewless_tensor() here is
+        #   likely redundant, since p2p_communication.py (likely originator)
+        #   already creates viewless tensors. That said, make_viewless_tensor()
+        #   is called here to be future-proof and corner-case-proof.
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        if self.config.sequence_parallel:
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+        else:
+            rng_context = nullcontext()
+        self.rng_context = rng_context
+
+        # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
+        # otherwise do nothing extra at the outer level
+        # if we are using other fp8 recipes, then the context manager enter&exit are free
+        # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
+        # control which layer will be fp8 or bf16
+        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        self.use_inner_fp8_context = use_inner_fp8_context
+        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        self.outer_fp8_context = outer_fp8_context
+
+        with rng_context, outer_fp8_context:
+            # Forward pass.
+            inner_fp8_context = (
+                get_fp8_context(self.config, layer.layer_number - 1)
+                if use_inner_fp8_context
+                else nullcontext()
+            )
+            with self.offload_context, inner_fp8_context:
+                self.layers[0].attention_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    context=context,
+                    context_mask=context_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    attention_bias=attention_bias,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    chunk_id=chunk_id,
+                )
+    
+    def dispatch(self,):
+        with self.rng_context, self.outer_fp8_context:
+            # Forward pass.
+            inner_fp8_context = (
+                get_fp8_context(self.config, layer.layer_number - 1)
+                if self.use_inner_fp8_context
+                else nullcontext()
+            )
+            with self.offload_context, inner_fp8_context:
+                self.layers[0].dispatch()
+    
+    def moe_forward(self,):
+        with self.rng_context, self.outer_fp8_context:
+            # Forward pass.
+            inner_fp8_context = (
+                get_fp8_context(self.config, layer.layer_number - 1)
+                if self.use_inner_fp8_context
+                else nullcontext()
+            )
+            with self.offload_context, inner_fp8_context:
+                self.layers[0].moe_forward()
+    
+    def combine(self,):
+        with self.rng_context, self.outer_fp8_context:
+            # Forward pass.
+            inner_fp8_context = (
+                get_fp8_context(self.config, layer.layer_number - 1)
+                if self.use_inner_fp8_context
+                else nullcontext()
+            )
+            with self.offload_context, inner_fp8_context:
+                self.layers[0].combine()
+    
+    def moe_post(self,):
+        with self.rng_context, self.outer_fp8_context:
+            # Forward pass.
+            inner_fp8_context = (
+                get_fp8_context(self.config, layer.layer_number - 1)
+                if self.use_inner_fp8_context
+                else nullcontext()
+            )
+            with self.offload_context, inner_fp8_context:
+                hidden_states, context = self.layers[0].moe_post()
+
+            if (
+                torch.is_grad_enabled()
+                and self.config.cpu_offloading
+                and self.group_prefetch_offload_commit_async is not None
+            ):
+                hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+        # Final layer norm.
+        if self.final_layernorm is not None:
+            hidden_states = self.final_layernorm(hidden_states)
+            # TENorm produces a "viewed" tensor. This will result in schedule.py's
+            # deallocate_output_tensor() throwing an error, so a viewless tensor is
+            # created to prevent this.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+
+        return hidden_states
+    
+    def moe_post_backward(self, output_grad, chunk_id):
+        self.layers[0].moe_post_backward(output_grad, chunk_id)
+
+    def combine_backward(self,):
+        self.layers[0].combine_backward()
+
+    def moe_backward(self,):
+        self.layers[0].moe_backward()
+
+    def dispatch_backward(self,):
+        self.layers[0].dispatch_backward()
+
+    def attention_backward(self,):
+        return self.layers[0].attention_backward()
+
     def backward(self, output_grad, chunk_id):
-        for layer in reversed(self.layers):
-            output_grad = layer.backward(output_grad, chunk_id)
+        output_grad = self.layers[0].backward(output_grad, chunk_id)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

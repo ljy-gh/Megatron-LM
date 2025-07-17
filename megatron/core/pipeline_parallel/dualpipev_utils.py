@@ -3,6 +3,7 @@ from typing import List, Callable, Optional
 
 import torch
 from torch.autograd import Variable
+from megatron_patch.template.helper import attention_forward
 
 
 def overlapped_forward_backward(
@@ -14,7 +15,6 @@ def overlapped_forward_backward(
     loss1: Optional[torch.Tensor],
     outputs1: Optional[List[torch.Tensor]],
     output_grads1: Optional[List[torch.Tensor]],
-    forward_step_func: Callable,
     is_last_stage0: bool,
     chunk_id0: int,
     chunk_id1: int,
@@ -31,9 +31,18 @@ def overlapped_forward_backward(
         inputs0_with_labels_loss_masks = list(inputs0)
         inputs0_with_labels_loss_masks.append(labels0)
         inputs0_with_labels_loss_masks.append(loss_masks0)
-        outputs0, loss_func = forward_step_func(inputs0_with_labels_loss_masks, module0, chunk_id0)
+        loss_func = attention_forward(inputs0_with_labels_loss_masks, module0, chunk_id0)
+        module0.dispatch()
+        module0.moe_forward()
+        module0.combine()
+        outputs0 = module0.moe_post()
     else:
-        outputs0, loss_func = forward_step_func(inputs0, module0, chunk_id0)
+        loss_func = attention_forward(inputs0, module0, chunk_id0)
+        module0.dispatch()
+        module0.moe_forward()
+        module0.combine()
+        outputs0 = module0.moe_post()
+
     outputs0 = [outputs0] if isinstance(outputs0, torch.Tensor) else outputs0
     if is_last_stage0:
         loss0 = loss_func(outputs0[0])[0]
@@ -41,9 +50,19 @@ def overlapped_forward_backward(
         loss0 = None
 
     if loss1 is not None:
-        module1.backward(loss1, None, chunk_id1)
+        # module1.backward(loss1, None, chunk_id1)
+        module1.moe_post_backward(loss1, None, chunk_id1)
+        module1.combine_backward()
+        module1.moe_backward()
+        module1.dispatch_backward()
+        module1.attention_backward()
     else:
-        module1.backward(None, output_grads1, chunk_id1)
+        # module1.backward(None, output_grads1, chunk_id1)
+        module1.moe_post_backward(None, output_grads1, chunk_id1)
+        module1.combine_backward()
+        module1.moe_backward()
+        module1.dispatch_backward()
+        module1.attention_backward()
 
     return outputs0, loss0
 
