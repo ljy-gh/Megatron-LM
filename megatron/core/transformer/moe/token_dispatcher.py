@@ -509,13 +509,33 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", tokens_per_expert
         )
+
+        # Prepare for AlltoAll communication
+        if self.output_splits is None:
+            # Equal split (all2all)
+            self.permutation_forward_output = torch.empty_like(permutated_local_input_tokens)
+            self.permutation_backward_output = torch.empty_like(permutated_local_input_tokens)
+        else:
+            # Unequal split (all2all-v)
+            self.permutation_forward_output = permutated_local_input_tokens.new_empty(
+                size=[sum(self.output_splits)] + list(permutated_local_input_tokens.size()[1:]),
+                dtype=permutated_local_input_tokens.dtype,
+                device=torch.cuda.current_device(),
+            )
+            self.permutation_backward_output = permutated_local_input_tokens.new_empty(
+                size=[sum(self.input_splits)] + list(permutated_local_input_tokens.size()[1:]),
+                dtype=permutated_local_input_tokens.dtype,
+                device=torch.cuda.current_device(),
+            )
+        
         return permutated_local_input_tokens, tokens_per_expert
 
     def token_permutation_alltoall(
         self, permutated_local_input_tokens: torch.Tensor
     ) -> torch.Tensor:
+
         global_input_tokens = all_to_all(
-            self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
+            self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits, self.permutation_forward_output, self.permutation_backward_output
         )
         return global_input_tokens
     
@@ -724,13 +744,32 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             hidden_states = reduce_scatter_to_sequence_parallel_region(
                 hidden_states, group=self.tp_group, input_split_sizes=input_split_sizes
             )
+
+        # Prepare for AlltoAll communication
+        if self.input_splits is None:
+            # Equal split (all2all)
+            self.unpermutation_forward_output = torch.empty_like(hidden_states)
+            self.unpermutation_backward_output = torch.empty_like(hidden_states)
+        else:
+            # Unequal split (all2all-v)
+            self.unpermutation_forward_output = hidden_states.new_empty(
+                size=[sum(self.input_splits)] + list(hidden_states.size()[1:]),
+                dtype=hidden_states.dtype,
+                device=torch.cuda.current_device(),
+            )
+            self.unpermutation_backward_output = hidden_states.new_empty(
+                size=[sum(self.output_splits)] + list(hidden_states.size()[1:]),
+                dtype=hidden_states.dtype,
+                device=torch.cuda.current_device(),
+            )
+        
         return hidden_states
     
     def token_unpermutation_alltoall(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         permutated_local_input_tokens = all_to_all(
-            self.ep_group, hidden_states, self.input_splits, self.output_splits
+            self.ep_group, hidden_states, self.input_splits, self.output_splits, self.unpermutation_forward_output, self.unpermutation_backward_output
         )
         return permutated_local_input_tokens
 
