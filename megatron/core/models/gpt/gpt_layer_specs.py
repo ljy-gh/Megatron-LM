@@ -317,6 +317,10 @@ def get_gpt_decoder_block_spec(
     config: TransformerConfig, use_transformer_engine: bool, normalization: Optional[str] = None
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    if normalization == "RMSNorm":
+        global LNImpl
+        LNImpl = WrappedTorchNorm
+    
     if use_transformer_engine:
         layer_norm_impl = TENorm
     else:
