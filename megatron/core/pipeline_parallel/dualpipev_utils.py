@@ -6,8 +6,7 @@ import torch
 from torch.autograd import Variable
 from megatron_patch.template.helper import attention_forward
 
-forward_stream = torch.cuda.Stream()
-backward_stream = torch.cuda.Stream()
+comm_stream = torch.cuda.Stream(device="cuda")
 
 def overlapped_forward_backward(
     module0: torch.nn.Module,
@@ -45,111 +44,52 @@ def overlapped_forward_backward(
     else:
         final_inputs1 = (None, output_grads1, chunk_id1)
 
-    global forward_stream
-    global backward_stream
+    global comm_stream
 
+    # stage 0
     loss_func = attention_forward(*final_inputs0)
-
-    if torch.distributed.get_rank() == 0:
-        print()
-    import time
-    start_time = time.perf_counter()
     
-    # 使用线程同时启动两个CUDA stream操作
-    def forward_operation():
-        with torch.cuda.stream(forward_stream):
+    # stage 1
+    def stage1():
+        with torch.cuda.stream(comm_stream):
             module0.dispatch()
-    
-    def backward_operation():
-        with torch.cuda.stream(backward_stream):
-            module1.moe_post_backward(*final_inputs1)
-    
-    # 创建并启动线程
-    forward_thread = threading.Thread(target=forward_operation)
-    backward_thread = threading.Thread(target=backward_operation)
-    
-    forward_thread.start()
-    backward_thread.start()
-    
-    # 等待两个线程完成
-    forward_thread.join()
-    backward_thread.join()
-    
-    torch.cuda.current_stream().wait_stream(forward_stream)
-    torch.cuda.current_stream().wait_stream(backward_stream)
-    end_time = time.perf_counter()
-    if torch.distributed.get_rank() == 0:
-        print(f"Time taken: {end_time - start_time} seconds")
-        print()
+    thread = threading.Thread(target=stage1)
+    thread.start()
+    module1.moe_post_backward(*final_inputs1)
+    thread.join()
+    torch.cuda.current_stream().wait_stream(comm_stream)
 
-    # 使用线程同时启动下一组操作
-    def forward_operation2():
-        with torch.cuda.stream(forward_stream):
-            module0.moe_forward()
-    
-    def backward_operation2():
-        with torch.cuda.stream(backward_stream):
+    # stage 2
+    def stage2():
+        with torch.cuda.stream(comm_stream):
             module1.combine_backward()
-    
-    forward_thread2 = threading.Thread(target=forward_operation2)
-    backward_thread2 = threading.Thread(target=backward_operation2)
-    
-    forward_thread2.start()
-    backward_thread2.start()
-    
-    forward_thread2.join()
-    backward_thread2.join()
-    
-    torch.cuda.current_stream().wait_stream(forward_stream)
-    torch.cuda.current_stream().wait_stream(backward_stream)
+    thread = threading.Thread(target=stage2)
+    thread.start()
+    module0.moe_forward()
+    thread.join()
+    torch.cuda.current_stream().wait_stream(comm_stream)
 
-    # 使用线程同时启动第三组操作
-    def forward_operation3():
-        with torch.cuda.stream(forward_stream):
+    # stage 3
+    def stage3():
+        with torch.cuda.stream(comm_stream):
             module0.combine()
-    
-    def backward_operation3():
-        with torch.cuda.stream(backward_stream):
-            module1.moe_backward()
-    
-    forward_thread3 = threading.Thread(target=forward_operation3)
-    backward_thread3 = threading.Thread(target=backward_operation3)
-    
-    forward_thread3.start()
-    backward_thread3.start()
-    
-    forward_thread3.join()
-    backward_thread3.join()
-    
-    torch.cuda.current_stream().wait_stream(forward_stream)
-    torch.cuda.current_stream().wait_stream(backward_stream)
+    thread = threading.Thread(target=stage3)
+    thread.start()
+    module1.moe_backward()
+    thread.join()
+    torch.cuda.current_stream().wait_stream(comm_stream)
 
-    # 使用线程同时启动第四组操作
-    outputs0_result = [None]  # 使用列表来存储结果
-    
-    def forward_operation4():
-        with torch.cuda.stream(forward_stream):
-            outputs0_result[0] = module0.moe_post()
-    
-    def backward_operation4():
-        with torch.cuda.stream(backward_stream):
+    # stage 4
+    def stage4():
+        with torch.cuda.stream(comm_stream):
             module1.dispatch_backward()
-    
-    forward_thread4 = threading.Thread(target=forward_operation4)
-    backward_thread4 = threading.Thread(target=backward_operation4)
-    
-    forward_thread4.start()
-    backward_thread4.start()
-    
-    forward_thread4.join()
-    backward_thread4.join()
-    
-    torch.cuda.current_stream().wait_stream(forward_stream)
-    torch.cuda.current_stream().wait_stream(backward_stream)
+    thread = threading.Thread(target=stage4)
+    thread.start()
+    outputs0 = module0.moe_post()
+    thread.join()
+    torch.cuda.current_stream().wait_stream(comm_stream)
 
-    # 获取forward操作的结果
-    outputs0 = outputs0_result[0]
-
+    # stage 5
     module1.attention_backward()
 
     # post-process
