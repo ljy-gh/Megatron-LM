@@ -431,14 +431,13 @@ class _AllToAll(torch.autograd.Function):
 
         input = input.contiguous()
         output = forward_output if forward_output is not None else backward_output
-        for i in range(100):
-            torch.distributed.all_to_all_single(
-                output,
-                input,
-                output_split_sizes=output_split_sizes,
-                input_split_sizes=input_split_sizes,
-                group=group,
-            )
+        torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+        )
         return output
 
     @staticmethod
