@@ -47,50 +47,50 @@ def overlapped_forward_backward(
     global comm_stream
 
     # stage 0
-    loss_func = attention_forward(*final_inputs0)
+    module1.moe_post_backward(*final_inputs1)
     
     # stage 1
     def stage1():
         with torch.cuda.stream(comm_stream):
-            module0.dispatch()
+            module1.combine_backward()
     thread = threading.Thread(target=stage1)
     thread.start()
-    module1.moe_post_backward(*final_inputs1)
+    loss_func = attention_forward(*final_inputs0)
     thread.join()
     torch.cuda.current_stream().wait_stream(comm_stream)
-
+    
     # stage 2
     def stage2():
         with torch.cuda.stream(comm_stream):
-            module1.combine_backward()
+            module0.dispatch()
     thread = threading.Thread(target=stage2)
     thread.start()
-    module0.moe_forward()
+    module1.moe_backward()
     thread.join()
     torch.cuda.current_stream().wait_stream(comm_stream)
 
     # stage 3
     def stage3():
         with torch.cuda.stream(comm_stream):
-            module0.combine()
+            module1.dispatch_backward()
     thread = threading.Thread(target=stage3)
     thread.start()
-    module1.moe_backward()
+    module0.moe_forward()
     thread.join()
     torch.cuda.current_stream().wait_stream(comm_stream)
 
     # stage 4
     def stage4():
         with torch.cuda.stream(comm_stream):
-            module1.dispatch_backward()
+            module0.combine()
     thread = threading.Thread(target=stage4)
     thread.start()
-    outputs0 = module0.moe_post()
+    module1.attention_backward()
     thread.join()
     torch.cuda.current_stream().wait_stream(comm_stream)
 
     # stage 5
-    module1.attention_backward()
+    outputs0 = module0.moe_post()
 
     # post-process
     outputs0 = [outputs0] if isinstance(outputs0, torch.Tensor) else outputs0
